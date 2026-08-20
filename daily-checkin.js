@@ -439,7 +439,7 @@ async function refreshTraeTokenIfNeeded(storagePath, storage, info, deviceId) {
       MachineID: storage['telemetry.machineId'] || '',
       PlatformCode: 'SOLO_PC',
       DeviceType: 'PC',
-      DeviceName: process.env.USERNAME || os.userInfo().username || '',
+      DeviceName: process.env.USERNAME || process.env.USER || '',
       DeviceModel: '',
       ClientVersion: ideVersion,
       DevicePublicKey: kp.publicKeyPEM,

@@ -1,7 +1,25 @@
 {
   "name": "daily-auto-checkin",
   "version": "1.0.0",
-  "description": "Windows 每日自动签到: 杜搭子(DuMate) / WorkBuddy / Trae Work CN, 零依赖, 凭据本地读取, 支持 Trae 令牌自动续期",
+  "description": "Windows 每日自动签到：杜搭子(DuMate) / WorkBuddy / Trae Work CN，零依赖，凭据本地读取，支持 Trae 令牌自动续期",
+  "homepage": "https://github.com/Wang-JQ77/daily-auto-checkin#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Wang-JQ77/daily-auto-checkin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Wang-JQ77/daily-auto-checkin/issues"
+  },
+  "keywords": [
+    "daily-checkin",
+    "auto-checkin",
+    "trae",
+    "dumate",
+    "workbuddy",
+    "checkin",
+    "automation",
+    "windows"
+  ],
   "scripts": {
     "checkin": "node daily-checkin.js --once",
     "status": "node daily-checkin.js --once --dry-run"

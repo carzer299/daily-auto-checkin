@@ -10,6 +10,12 @@ $ErrorActionPreference = 'Stop'
 # 1) 检查 Node.js
 try {
     $node = (Get-Command node -ErrorAction Stop).Source
+    $version = & node -v
+    if ($version -match 'v(\d+)\.' -and [int]$Matches[1] -lt 18) {
+        Write-Host "[错误] Node.js 版本过低 ($version)，需要 >= 18: https://nodejs.org/" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[OK] Node.js $version ($node)"
 } catch {
     Write-Host "[错误] 未找到 node，请先安装 Node.js 18 或更高版本: https://nodejs.org/" -ForegroundColor Red
     exit 1
