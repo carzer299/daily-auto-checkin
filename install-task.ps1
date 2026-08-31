@@ -1,4 +1,4 @@
-# daily-auto-checkin 安装脚本：注册 Windows 计划任务，开机自动签到
+﻿# daily-auto-checkin 安装脚本：注册 Windows 计划任务，开机自动签到
 # 用法: .\install-task.ps1 [-Time "09:30"] [-RunNow]
 param(
     [string]$Time = "09:30",
