@@ -11,6 +11,7 @@
  *   - 内置每日自动运行（常驻守护，默认每天 09:30，可用环境变量 CHECKIN_TIME=HH:MM 覆盖）
  *   - 幂等保护（已在检查查询层兜底"今日已签到"）
  *   - 防重入锁（lock 目录，避免多实例同时领取）
+ *   - 网络就绪探测 + 失败自动重试（扛过开机时网络未就绪 / 瞬时抖动）
  *   - 合并关键日志落盘 ~/.daily-checkin/logs/ 与 CRITICAL 持久文件
  */
 'use strict';
@@ -145,12 +146,52 @@ async function httpJson(url, { method = 'GET', headers = {}, body, timeoutMs = 3
     let data = null;
     try { data = JSON.parse(text); } catch { /* 非 JSON 响应 */ }
     return { status: res.status, headers: res.headers, data, text };
+  } catch (err) {
+    // fetch 失败的真实原因藏在 error.cause 链里（DNS/连接重置/TLS 等），逐层展开便于日志排查；
+    // 统一包装为带 .network 标记的错误，供上层判断是否值得自动重试。
+    if (err.name === 'AbortError') {
+      const e = new Error(`请求超时(${timeoutMs}ms): ${url}`);
+      e.network = true;
+      throw e;
+    }
+    const parts = [];
+    const seen = new Set();
+    let e = err;
+    while (e && !seen.has(e)) {
+      seen.add(e);
+      const bit = e.code || e.message || e.name || '';
+      if (bit && !parts.includes(bit)) parts.push(bit);
+      e = e.cause;
+    }
+    const wrapped = new Error(`网络请求失败: ${parts.join(' -> ')}`);
+    wrapped.network = true;
+    throw wrapped;
   } finally {
     clearTimeout(timer);
   }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 网络就绪探测：计划任务常在开机/登录后立即触发，此时网络栈（DNS/网卡/代理）可能尚未就绪，
+// 直接发起签到会整片 fetch failed。探测稳定端点，失败则等待重试，最多等 waitSec 秒。
+async function waitForNetwork(waitSec = 180) {
+  const deadline = Date.now() + waitSec * 1000;
+  while (Date.now() < deadline) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      try {
+        const res = await fetch('https://www.baidu.com', { method: 'GET', signal: ctrl.signal });
+        if (res.status < 500) return true;
+      } finally {
+        clearTimeout(t);
+      }
+    } catch { /* 网络未就绪，继续等 */ }
+    await sleep(15000);
+  }
+  return false;
+}
 
 // 毫秒到 HH 时间文本（用于日志展示）
 function hhmmOf(ms) {
@@ -645,6 +686,33 @@ function filterTasks() {
   return filtered;
 }
 
+// 网络类错误识别：瞬时抖动（DNS/连接重置/超时/代理/TLS）值得自动重试；凭证/业务类错误不重试
+function isNetworkError(msg) {
+  return /网络请求失败|请求超时|fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|SOCKET|socket hang up|CERT_|TLS/i.test(msg);
+}
+
+// 单产品签到：网络类失败按递增间隔自动重试（15s → 60s → 180s），扛过开机/网络抖动；
+// 凭证失效/频控/业务错误不重试，直接返回失败结果（幂等，次日任务会自动再试）
+async function runTaskWithRetry(name, fn) {
+  const retryDelaysSec = [15, 60, 180];
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retryDelaysSec.length; attempt++) {
+    try {
+      // 每次尝试（含重试）之间加随机 2~8 秒间隔，避免整齐划一的请求特征
+      await sleep(2000 + Math.floor(Math.random() * 6000));
+      const msg = await withLock(name, fn);
+      return { name, ok: true, msg };
+    } catch (err) {
+      lastErr = err;
+      const msg = err.message || String(err);
+      if (!isNetworkError(msg) || attempt >= retryDelaysSec.length) break;
+      log([`[重试] ${name}: ${msg}，${retryDelaysSec[attempt]} 秒后第 ${attempt + 1} 次重试`]);
+      await sleep(retryDelaysSec[attempt] * 1000);
+    }
+  }
+  return { name, ok: false, msg: lastErr ? (lastErr.message || String(lastErr)) : '未知错误' };
+}
+
 // 执行一轮签到，返回结果数组
 async function runRound() {
   const tasks = filterTasks();
@@ -654,18 +722,11 @@ async function runRound() {
   }
   const results = [];
   for (const [name, fn] of tasks) {
-    try {
-      // 每个产品之间加随机 2~8 秒间隔，避免整齐划一的请求特征
-      await sleep(2000 + Math.floor(Math.random() * 6000));
-      const msg = await withLock(name, fn);
-      results.push({ name, ok: true, msg });
-    } catch (err) {
-      const msg = err.message || String(err);
-      results.push({ name, ok: false, msg });
-      // 凭证失效/登录态失效/频控均可间歇发生，写入 CRITICAL 以便人工关注
-      if (/(过期|失效|频控|重新登录|强制退出|未登录)/.test(msg)) {
-        logCritical(name, msg);
-      }
+    const r = await runTaskWithRetry(name, fn);
+    results.push(r);
+    // 凭证失效/登录态失效/频控均可间歇发生，写入 CRITICAL 以便人工关注
+    if (!r.ok && /(过期|失效|频控|重新登录|强制退出|未登录)/.test(r.msg)) {
+      logCritical(name, r.msg);
     }
   }
   return results;
@@ -729,6 +790,15 @@ async function onceRound() {
 (async () => {
   ensureDirs();
   try {
+    // 开机/登录触发的计划任务常遇网络未就绪：先等网络就绪（最多 3 分钟）
+    if (!(await waitForNetwork(180))) {
+      const msg = '等待 180 秒后网络仍未就绪';
+      if (ONCE) {
+        log([msg + '，本轮退出（下次触发/补跑会自动重试）']);
+        process.exit(1);
+      }
+      log([msg + '，继续执行（由失败重试逻辑兜底）']);
+    }
     if (LOOP) {
       await daemonLoop();
     } else {
