@@ -73,6 +73,7 @@ node daily-checkin.js                     # 守护模式：常驻后台每天自
 | `CHECKIN_TIME` | `09:30` | 每日签到时间（守护模式） |
 | `CHECKIN_TIMES` | 同 `CHECKIN_TIME` | 多时间点，逗号分隔，如 `00:05,09:30,18:00` |
 | `CHECKIN_BASE_DIR` | `~/.daily-checkin` | 状态/日志目录 |
+| `WB_CHECKIN_APP_EXE` | 自动探测 | WorkBuddy 客户端可执行文件完整路径（仅 v5.6+ 加密登录态需要，用于自动探测失败时兜底） |
 
 ## 工作原理
 
@@ -81,8 +82,13 @@ node daily-checkin.js                     # 守护模式：常驻后台每天自
 | 产品 | 凭据来源 |
 |------|---------|
 | 杜搭子 | `%APPDATA%\qianfan-desktop-app`（AES-256-GCM 加密 cookie） |
-| WorkBuddy | `%LOCALAPPDATA%\CodeBuddyExtension` 会话文件 |
+| WorkBuddy | `%LOCALAPPDATA%\CodeBuddyExtension` 会话文件（v5.6+ 为加密登录态，见下） |
 | Trae Work CN | `%APPDATA%\TRAE SOLO CN` storage.json（AES 加密凭据） |
+
+**WorkBuddy 加密登录态（v5.6 起）**：桌面端 v5.6 起把会话文件里的令牌从明文改成了字段级加密（`{ "$wbEncrypted": 1, "envelope": ... }`，AES-256-GCM），解封密钥编译在客户端本体内部，外部程序拿不到。脚本的处理方式是按需借用客户端本体：以 Node 模式启动它、由它解封、再回传令牌（不修改客户端任何文件，令牌只在内存中流转）。
+
+- v5.3.8 ~ v5.5 的明文登录态**不受影响**，仍是直接读取，不依赖客户端在场；
+- v5.6+ 需要**本机已安装 WorkBuddy 客户端**；客户端装在非标准目录时可用环境变量 `WB_CHECKIN_APP_EXE` 指定其完整路径。
 
 **Trae 令牌自动续期**：Trae 的访问令牌约 8 天过期。脚本在令牌剩余不足 24 小时时，使用客户端设备密钥对（P-256 签名）调用官方 `ExchangeToken` 接口自动续期，并把新令牌按原加密格式写回 storage.json——客户端与脚本共用同一份凭据。续期前会自动备份原文件到 `~\.daily-checkin\backups\`。
 

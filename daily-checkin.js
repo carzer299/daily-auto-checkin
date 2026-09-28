@@ -19,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
+const { spawnSync } = require('child_process');
 
 // ---------------- CLI / 环境解析 ----------------
 const DRY_RUN = process.argv.includes('--dry-run');
@@ -218,12 +219,218 @@ function msUntilNextCheckin(timeList) {
 }
 
 // ---------------- WorkBuddy ----------------
+// 登录态文件位置（v5.3.8+ 起桌面端写在 %LOCALAPPDATA%）
+const WB_AUTH_REL = path.join('CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info');
+
+// WorkBuddy 桌面端 v5.6+ 把 auth.accessToken 从「明文字符串」改成了「字段级加密信封」：
+//   { "$wbEncrypted": 1, "envelope": "<base64>" }   // at-rest sym-v1，AES-256-GCM
+// 解封密钥由桌面端本体的原生模块在启动时提供，外部进程（普通 Node / 官方 Electron）取不到。
+// 唯一可行的解法是"借用"桌面端本体：以 ELECTRON_RUN_AS_NODE=1 启动它时它等同 Node，
+// 但仍可访问内置的静态钥。为此本文件内置了一个隐藏子模式 --wb-token-dump（见文件末尾），
+// 由 checkinWorkbuddy() 以子进程方式调用，专门用于解封并回传令牌。
+//
+// 向后兼容要点：明文登录态（v5.3.8 ~ v5.5）走 resolveWorkbuddyToken 的第一条分支直接返回，
+// 完全不需要桌面端在场，行为与改动前一致；下面这套加密逻辑只在"看到锁"时才会被用到。
+
+// at-rest sym-v1 的常量（对齐桌面端 at-rest-crypto 包）
+const WB_AAD_DOMAIN = Buffer.from('WB-AAD\0', 'ascii');
+const WB_FORMAT_ID = { file: 'WBEF1', field: 'WBEV1', record: 'WBER1', stream: 'WBES1' };
+const WB_FRAMING_CODE = { file: 1, field: 2, record: 3, stream: 4 };
+
+function wbEncodeUint32(n) {
+  const b = Buffer.allocUnsafe(4);
+  b.writeUInt32BE(n);
+  return b;
+}
+function wbEncodeLengthPrefixed(str) {
+  const b = Buffer.from(str, 'utf8');
+  return Buffer.concat([wbEncodeUint32(b.length), b]);
+}
+// AAD = 域前缀 | 版本 | 格式号 | 方案 | suite | 密钥编号 | 分帧码 | 时序 | 终止位
+function wbBuildFieldAad(keyId, suite, scheme, framing) {
+  return Buffer.concat([
+    WB_AAD_DOMAIN,
+    Buffer.from([1]),
+    wbEncodeLengthPrefixed(WB_FORMAT_ID[framing]),
+    wbEncodeLengthPrefixed(scheme),
+    wbEncodeUint32(suite),
+    wbEncodeLengthPrefixed(keyId),
+    Buffer.from([WB_FRAMING_CODE[framing]]),
+    Buffer.from([0]),
+    Buffer.from([0]),
+  ]);
+}
+
+// 判断字段值是否是加密信封
+function wbIsEncryptedField(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const keys = Object.keys(v).sort();
+  return keys.length === 2 && keys[0] === '$wbEncrypted' && keys[1] === 'envelope' &&
+    v.$wbEncrypted === 1 && typeof v.envelope === 'string';
+}
+
+// 取得解封密钥：仅当本脚本运行在 WorkBuddy 自带运行时内（见 --wb-token-dump 子模式）才可用
+function wbKeyMaterial() {
+  if (typeof process._linkedBinding !== 'function') {
+    throw new Error('当前运行时不支持访问 WorkBuddy 内置密钥（需由 WorkBuddy 客户端执行）');
+  }
+  let binding;
+  try {
+    binding = process._linkedBinding('electron_browser_workbuddy_storage');
+  } catch {
+    // 普通 Node / 官方 Electron 上必然走到这里：内置密钥只存在于客户端本体中
+    throw new Error('无法访问 WorkBuddy 内置密钥（当前进程不是由 WorkBuddy 客户端运行的）');
+  }
+  if (!binding || typeof binding.loggerGet !== 'function') {
+    throw new Error('当前运行时缺少 WorkBuddy 内置密钥接口');
+  }
+  const raw = binding.loggerGet();
+  const payload = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8'));
+  if (!payload || payload.version !== 1 || typeof payload.atRestSecretKey !== 'string') {
+    throw new Error('WorkBuddy 内置密钥载荷格式异常');
+  }
+  const key = crypto.createHash('sha256').update(payload.atRestSecretKey, 'utf8').digest();
+  const keyId = crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
+  return { key, keyId };
+}
+
+// 解封单个字段信封，返回明文
+function wbOpenFieldEnvelope(wrapper, keyMaterial) {
+  const env = JSON.parse(Buffer.from(wrapper.envelope, 'base64').toString('utf8'));
+  if (env.keyId !== keyMaterial.keyId) {
+    throw new Error('信封密钥编号与本机不一致（登录态可能来自其它机器或其它安装）');
+  }
+  const d = crypto.createDecipheriv('aes-256-gcm', keyMaterial.key, Buffer.from(env.nonce, 'base64'), { authTagLength: 16 });
+  d.setAAD(wbBuildFieldAad(env.keyId, env.suite, 'sym-v1', 'field'));
+  d.setAuthTag(Buffer.from(env.authTag, 'base64'));
+  return Buffer.concat([d.update(Buffer.from(env.ciphertext, 'base64')), d.final()]).toString('utf8');
+}
+
+// 从注册表的 workbuddy:// 协议处理器里取客户端可执行文件路径（可覆盖装在非系统盘的情况）
+function wbExeFromRegistry() {
+  if (process.platform !== 'win32') return '';
+  for (const scheme of ['workbuddy', 'codebuddy']) {
+    try {
+      const r = spawnSync('reg.exe', ['query', `HKCU\\Software\\Classes\\${scheme}\\shell\\open\\command`, '/ve'],
+        { encoding: 'utf8', timeout: 5000, windowsHide: true });
+      const m = /"([^"]+\.exe)"/i.exec(String(r.stdout || ''));
+      if (m && fs.existsSync(m[1])) return m[1];
+    } catch { /* 注册表不可用时忽略 */ }
+  }
+  return '';
+}
+
+// 定位 WorkBuddy 客户端可执行文件：环境变量 → 协议注册表 → 常见安装目录 → 逐盘符扫描
+function findWorkbuddyExe() {
+  for (const p of [process.env.WB_CHECKIN_APP_EXE, process.env.WORKBUDDY_APP_EXE]) {
+    if (p && fs.existsSync(p)) return p;
+  }
+  const reg = wbExeFromRegistry();
+  if (reg) return reg;
+
+  const roots = [
+    path.join(LOCALAPPDATA, 'Programs'),
+    process.env.ProgramFiles ? path.join(process.env.ProgramFiles, '') : '',
+    process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], '') : '',
+  ].filter(Boolean);
+  const list = [
+    // macOS 常规安装位置
+    '/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy',
+    '/Applications/CodeBuddy.app/Contents/MacOS/CodeBuddy',
+  ];
+  for (const root of roots) {
+    for (const dirName of ['WorkBuddy', 'CodeBuddy']) {
+      for (const exeName of ['WorkBuddy.exe', 'CodeBuddy.exe']) {
+        list.push(path.join(root, dirName, exeName));
+      }
+    }
+  }
+  // 安装目录可能不在系统盘（如 E:\Users\<user>\AppData\Local\Programs\WorkBuddy），按盘符探测
+  const user = process.env.USERNAME || '';
+  if (process.platform === 'win32' && user) {
+    for (let i = 65; i <= 90; i++) {
+      list.push(path.join(`${String.fromCharCode(i)}:\\`, 'Users', user, 'AppData', 'Local', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'));
+    }
+  }
+  for (const p of list) {
+    try { if (p && fs.existsSync(p)) return p; } catch { /* 无权限的盘符直接跳过 */ }
+  }
+  return '';
+}
+
+/**
+ * 取得可用的 WorkBuddy 令牌。
+ * - 明文登录态（v5.3.8 ~ v5.5）：直接返回，不依赖客户端，行为与改动前完全一致
+ * - 加密登录态（v5.6+）：借用客户端本体（Node 模式）解封后返回
+ */
+/**
+ * 以子进程方式让客户端本体（Node 模式）解封令牌
+ * 正常路径：直接启动客户端可执行文件；
+ * 兜底路径：某些终端管控/沙箱环境会拦截"直接从脚本启动桌面程序"，
+ *          此时回退到经 cmd.exe 中转再试一次。
+ */
+function wbRunTokenDump(exe) {
+  const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1' };
+  delete env.NODE_OPTIONS;
+  const opts = { env, encoding: 'utf8', timeout: 30000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 };
+  let r = spawnSync(exe, [__filename, '--wb-token-dump'], opts);
+  const text = String(r.stdout || '');
+  if (!/^WB_TOKEN:/m.test(text) && r.error) {
+    try {
+      const r2 = spawnSync(process.env.ComSpec || 'cmd.exe', ['/c', `"${exe}" "${__filename}" --wb-token-dump`], opts);
+      if (String(r2.stdout || '') || String(r2.stderr || '')) r = r2;
+    } catch { /* 兜底失败则沿用首次结果 */ }
+  }
+  const out = String(r.stdout || '');
+  const hit = /^WB_TOKEN:(.+)$/m.exec(out);
+  if (hit) return { token: hit[1].trim() };
+  const err = /^WB_TOKEN_ERR:(.*)$/m.exec(out);
+  if (err) return { error: err[1] };
+  if (r.error) return { error: `无法启动 WorkBuddy 客户端解封令牌: ${r.error.message}` };
+  return { error: `WorkBuddy 令牌解封失败（子进程无有效输出，退出码 ${r.status}）` };
+}
+
+/**
+ * 取得可用的 WorkBuddy 令牌。
+ * - 明文登录态（v5.3.8 ~ v5.5）：直接返回，不依赖客户端，行为与改动前完全一致
+ * - 加密登录态（v5.6+）：借用客户端本体（Node 模式）解封后返回
+ */
+function resolveWorkbuddyToken(rawToken) {
+  if (typeof rawToken === 'string' && rawToken) return rawToken;
+  if (!wbIsEncryptedField(rawToken)) {
+    throw new Error('WorkBuddy 会话文件中没有可用的 accessToken，请先打开 WorkBuddy 客户端登录一次');
+  }
+  // 捷径：本脚本若已运行在客户端运行时内（被客户端以 Node 模式启动），可直接解封，无需派生进程
+  try {
+    const keyMaterial = wbKeyMaterial();
+    try {
+      return wbOpenFieldEnvelope(rawToken, keyMaterial);
+    } finally {
+      keyMaterial.key.fill(0);
+    }
+  } catch { /* 普通 Node 下必然失败，继续走下方"借用客户端"方案 */ }
+
+  const exe = findWorkbuddyExe();
+  if (!exe) {
+    throw new Error('WorkBuddy 登录态已加密(v5.6+)，需要借用客户端解封，但未找到客户端可执行文件；' +
+      '可用环境变量 WB_CHECKIN_APP_EXE=<WorkBuddy.exe 完整路径> 指定');
+  }
+  const r = wbRunTokenDump(exe);
+  if (r.token) return r.token;
+  throw new Error(`WorkBuddy 令牌解封失败: ${r.error}`);
+}
+
 async function checkinWorkbuddy() {
-  const sessionFile = path.join(LOCALAPPDATA, 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info');
-  const session = JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
-  const token = session?.auth?.accessToken;
+  const sessionFile = path.join(LOCALAPPDATA, WB_AUTH_REL);
+  let session;
+  try {
+    session = JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
+  } catch {
+    throw new Error('读取 WorkBuddy 会话文件失败，请先打开 WorkBuddy 客户端登录一次');
+  }
+  const token = resolveWorkbuddyToken(session?.auth?.accessToken);
   const uid = session?.account?.uid;
-  if (!token || !uid) throw new Error('会话文件中缺少 accessToken/uid，请先在 WorkBuddy 客户端登录');
+  if (!uid) throw new Error('会话文件中缺少 uid，请先在 WorkBuddy 客户端登录');
 
   const base = 'https://copilot.tencent.com';
   const headers = {
@@ -237,7 +444,8 @@ async function checkinWorkbuddy() {
   const status = await httpJson(`${base}/v2/billing/meter/checkin-activity-status`, { method: 'POST', headers, body: {} });
   if (status.status !== 200 || status.data?.code !== 0) {
     if (status.status === 401 || status.data?.code === 401) {
-      throw new Error('WorkBuddy 登录态已失效，请打开 WorkBuddy 客户端重新登录');
+      // 令牌本身能解出来却仍被拒，才是真的登录态过期
+      throw new Error('WorkBuddy 登录态已过期（服务端拒绝），请打开 WorkBuddy 客户端刷新后重试');
     }
     throw new Error(`查询签到状态失败: HTTP ${status.status}, code=${status.data?.code}, msg=${status.data?.msg}`);
   }
@@ -784,6 +992,32 @@ async function onceRound() {
   summarize(results);
   if (results.length > 0 && results.every((r) => !r.ok)) return 1; // 全部失败
   return 0;
+}
+
+// ---------------- 隐藏子模式：仅解封 WorkBuddy 令牌 ----------------
+// 由 resolveWorkbuddyToken() 以「ELECTRON_RUN_AS_NODE=1 <WorkBuddy 客户端> 本文件 --wb-token-dump」
+// 的方式调用：此时客户端以 Node 方式运行本脚本，因而可访问它内置的解封密钥。
+// 只输出一行 WB_TOKEN:<令牌> 或 WB_TOKEN_ERR:<原因>，不做签到、不写日志、不落盘任何内容。
+if (process.argv.includes('--wb-token-dump')) {
+  (() => {
+    const out = (s) => process.stdout.write(s + '\n');
+    try {
+      const session = JSON.parse(fs.readFileSync(path.join(LOCALAPPDATA, WB_AUTH_REL), 'utf8'));
+      const raw = session?.auth?.accessToken;
+      if (typeof raw === 'string' && raw) { out('WB_TOKEN:' + raw); process.exit(0); }
+      if (!wbIsEncryptedField(raw)) throw new Error('登录态中没有可用的 accessToken');
+      const keyMaterial = wbKeyMaterial();
+      try {
+        out('WB_TOKEN:' + wbOpenFieldEnvelope(raw, keyMaterial));
+      } finally {
+        keyMaterial.key.fill(0); // 密钥用后立即清零
+      }
+      process.exit(0);
+    } catch (err) {
+      out('WB_TOKEN_ERR:' + (err && err.message ? err.message : String(err)));
+      process.exit(1);
+    }
+  })();
 }
 
 // ---------------- 入口 ----------------
