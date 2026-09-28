@@ -28,7 +28,7 @@ Windows 每日自动签到：**杜搭子(DuMate) / WorkBuddy / Trae Work CN** �
 |------|---------|
 | [杜搭子 DuMate](https://yumenzhushou.baidu.com/) | 每日 +500 积分 |
 | WorkBuddy（腾讯） | 每日 +100 积分 |
-| TRAE SOLO CN | 每日 +200 积分 |
+| TRAE SOLO CN | 每日 +150 积分 |
 
 ## 快速开始
 
