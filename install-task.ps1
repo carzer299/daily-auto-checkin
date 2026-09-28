@@ -27,6 +27,27 @@ New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Copy-Item (Join-Path $PSScriptRoot 'daily-checkin.js') (Join-Path $dest 'daily-checkin.js') -Force
 Write-Host "[OK] 脚本已部署到 $dest\daily-checkin.js"
 
+# 2.5) 生成无窗口启动器：node.exe 是控制台程序，计划任务直接运行它时
+#      每次触发都会在桌面弹出黑色命令行窗口；改由 wscript（GUI 程序，
+#      本身无控制台）以隐藏窗口方式启动 node，触发时全程不弹任何窗口
+$vbsPath = Join-Path $dest 'hidden-run.vbs'
+$vbsContent = @'
+' 后台隐藏运行签到脚本：wscript 无控制台窗口，node 以隐藏窗口执行，全程不弹窗
+' 固定带 --once（单次执行后退出，适配计划任务）；附加参数原样追加给 daily-checkin.js
+' 用法: wscript.exe hidden-run.vbs [附加参数...]（如 --dry-run）
+Set sh = CreateObject("WScript.Shell")
+extra = ""
+For Each a In WScript.Arguments
+    extra = extra & " """ & a & """"
+Next
+exitCode = sh.Run("""__NODE__"" ""__SCRIPT__"" ""--once""" & extra, 0, True)
+WScript.Quit exitCode
+'@
+# 替换占位符为本机的 node 与脚本绝对路径；用 ANSI 编码保存以兼容含中文的用户目录
+$vbsContent = $vbsContent.Replace('__NODE__', $node).Replace('__SCRIPT__', (Join-Path $dest 'daily-checkin.js'))
+Set-Content -Path $vbsPath -Value $vbsContent -Encoding Default
+Write-Host "[OK] 无窗口启动器已生成: $vbsPath"
+
 # 3) 校验签到时间格式
 if ($Time -notmatch '^\d{1,2}:\d{2}$') {
     Write-Host "[错误] 时间格式应为 HH:MM，当前为: $Time" -ForegroundColor Red
@@ -34,7 +55,9 @@ if ($Time -notmatch '^\d{1,2}:\d{2}$') {
 }
 
 # 4) 注册计划任务：登录时 + 每日定时 双触发
-$action = New-ScheduledTaskAction -Execute $node -Argument "`"$dest\daily-checkin.js`" --once" -WorkingDirectory $dest
+#    通过无窗口启动器（wscript + hidden-run.vbs）运行，触发时桌面不再弹出黑色窗口
+$action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" `
+    -Argument "`"$dest\hidden-run.vbs`"" -WorkingDirectory $dest
 
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $logonTrigger.Delay = 'PT30S'   # 登录后 30 秒再执行，等网络就绪
@@ -48,10 +71,10 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 1)
 
 Register-ScheduledTask -TaskName 'DailyCheckin' `
-    -Description "每日自动签到: 杜搭子(DuMate) / WorkBuddy / Trae Work CN (登录时与每天 $Time 触发, 幂等可重复执行)" `
+    -Description "每日自动签到(后台无弹窗): 杜搭子(DuMate) / WorkBuddy / Trae Work CN (登录时与每天 $Time 触发, 幂等可重复执行)" `
     -Action $action -Trigger $logonTrigger, $dailyTrigger -Settings $settings -Force | Out-Null
 
-Write-Host "[OK] 计划任务 DailyCheckin 已注册" -ForegroundColor Green
+Write-Host "[OK] 计划任务 DailyCheckin 已注册（无窗口后台运行）" -ForegroundColor Green
 Write-Host "     - 每次登录后 30 秒自动签到"
 Write-Host "     - 每天 $Time 自动签到"
 Write-Host "     - 错过时间点(电脑关机)会在下次开机自动补签"
